@@ -3,18 +3,17 @@ import numpy as np
 import random
 
 
-def get_U_matrix(W: np.ndarray, sigma: float) -> np.ndarray:
+def get_U_matrix(W: np.ndarray) -> np.ndarray:
     """
     Normalise an adjacency matrix based on its degree and a regulariser sigma.
 
     Args:
         W (np.ndarray): Weighted adjacency matrix of shape (n_nodes, n_nodes).
-        sigma (float): Regularisation parameter.
     """
     degrees = np.sum(W, axis=1)
     U = W / np.sqrt(degrees[:, None] @ degrees[None, :])
 
-    return U * sigma**2
+    return U
 
 
 # ----- Functions to do with sampling random walks. -----

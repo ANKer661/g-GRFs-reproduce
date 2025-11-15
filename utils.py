@@ -1,0 +1,280 @@
+import random
+from typing import Callable
+
+import numpy as np
+import scipy
+from scipy.special import gammaln
+
+
+class GroundtruthKernels:
+    """Compute the groundtruth kernel evaluations."""
+
+    def __init__(self, sigma: float, alpha: float) -> None:
+        self.functions = {
+            1: self.d_regularised_1,
+            2: self.d_regularised_2,
+            3: self.p_step_rw_2,
+            4: self.diffusion,
+            5: self.cosine,
+        }
+
+        self.sigma = sigma
+        self.alpha = alpha
+
+    def d_regularised_1(self, U: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+        """
+        d regularised Lapacian kernel with d=1. (I - W)^{-1}
+        """
+        E = np.eye(U.shape[0])
+        U = self.sigma**2 / (1 + self.sigma**2) * U
+        return np.linalg.inv((E - U)), U
+
+    def d_regularised_2(self, U: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+        """d regularised Lapacian kernel with d=2. (I - W)^{-2}"""
+        E = np.eye(U.shape[0])
+        U = self.sigma**2 / (1 + self.sigma**2) * U
+        I_minus_U = E - U
+        return np.linalg.inv(I_minus_U @ I_minus_U), U
+
+    def p_step_rw_2(self, U: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+        """p step RW kernel with d=2, (I + W)^2"""
+        E = np.eye(U.shape[0])
+        U = U / (self.alpha - 1)
+        I_plus_U = E + U
+        return I_plus_U @ I_plus_U, U
+
+    def diffusion(self, U: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+        """Diffusion kernel, exp(W)"""
+        U = self.sigma**2 * U / 2
+        return scipy.linalg.expm(U), U
+
+    def cosine(self, U: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+        """Cosine kernel, sqrt{2}cos(pi/4-U) = cos(U) + sin(U)."""
+        U = self.sigma**2 * U
+        return scipy.linalg.sinm(U) + scipy.linalg.cosm(U), U
+
+    def get_groundtruth_kernel(self, func_type: int, U: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+        """
+        Get the result of the modulation function of the given type.
+
+        Args:
+            func_type (int): The type of modulation (1 to 5).
+            U (np.ndarray): The input matrix.
+        """
+        if func_type not in self.functions:
+            raise ValueError(f"Invalid function type {func_type}. Must be between 1 and 5.")
+        return self.functions[func_type](U)
+
+
+class ModulationFunctions:
+    """
+    Modulation functions to generate GRFs, based on inverse convolution of Taylor expansion.
+    """
+
+    def __init__(self) -> None:
+        self.functions = {
+            1: self.d_regularised_1,
+            2: self.d_regularised_2,
+            3: self.p_step_rw_2,
+            4: self.diffusion,
+            5: self.cosine,
+        }
+
+    def d_regularised_1(self, x: int) -> float:
+        if x == 0:
+            return 1
+        else:
+            return scipy.special.factorial2(2 * x - 1) / (scipy.special.factorial2(2 * x))
+
+    def d_regularised_2(self, x: int) -> float:
+        return 1
+
+    def p_step_rw_2(self, x: int) -> float:
+        return scipy.special.binom(1, x)
+
+    def diffusion(self, x: int) -> float:
+        # 1 / (2**x * scipy.special.factorial(x))
+        # Use log to avoid overflow
+        log_val = -(x * np.log(2) + gammaln(x + 1))
+        return np.exp(log_val)
+
+    def alpha_func_cosine(self, k: int) -> float:
+        return (-1) ** (k // 2) / scipy.special.factorial(k)
+
+    def get_next_f_cosine(self, g_eval: float) -> float:
+        """Helper function for computing next f function evaluation."""
+
+        f0 = self.f_list[0]
+        f1 = self.f_list[1:]
+        f1_np = np.asarray(f1)
+        f1r_np = f1_np[::-1]
+        f1dot = np.dot(f1_np, f1r_np)
+        fnext = (g_eval - f1dot) / (2 * f0)
+        self.f_list.append(fnext)
+
+        return fnext
+
+    def cosine(self, x: int) -> float:
+        """
+        Here, there isn't a convenient closed form so we use the iterative formula in Eq. 6
+        * Optimized with caching *
+        """
+        if not hasattr(self, "f_list"):
+            self.f_list = [1.0]
+        if x < len(self.f_list):
+            return self.f_list[x]
+        else:
+            max_known = len(self.f_list) - 1
+            for i in range(max_known, x):
+                self.get_next_f_cosine(self.alpha_func_cosine(i + 1))
+            return self.f_list[-1]
+
+
+def get_U_matrix(W: np.ndarray) -> np.ndarray:
+    """
+    Normalise an adjacency matrix based on its degree and a regulariser sigma.
+
+    Args:
+        W (np.ndarray): Weighted adjacency matrix of shape (n_nodes, n_nodes).
+    """
+    degrees = np.sum(W, axis=1)
+    U = W / np.sqrt(degrees[:, None] @ degrees[None, :])
+
+    return U
+
+
+# ----- Functions to do with sampling random walks. -----
+
+
+def adj_matrix_to_lists(W: np.ndarray) -> tuple[list[list[int]], list[list[float]]]:
+    """Get adjacency lists and weight lists for a weighted adjacency matrix"""
+    n = W.shape[0]
+    adj_lists = []
+    weight_lists = []
+
+    for i in range(n):
+        neighbor_idx = np.nonzero(W[i, :])[0]
+        weights = W[i, neighbor_idx]
+        adj_lists.append(neighbor_idx.tolist())
+        weight_lists.append(weights.tolist())
+
+    return adj_lists, weight_lists
+
+
+def simulate_single_walk(adj_lists: list[list[int]], start_v: int, p_halt: float) -> list[int]:
+    """Do a simple random walk and get vertex history."""
+    path = [start_v]  # Set starting vertex
+    cur_v = start_v
+    # while np.random.random() > p_halt:  # Terminate with probability p
+    #     cur_v = int(np.random.choice(adj_lists[cur_v]))  # Choose a new vertex
+    #     path.append(cur_v)
+    while random.uniform(0, 1) > p_halt:  # Terminate with probability p
+        random_index = int(random.uniform(0, 1) * len(adj_lists[cur_v]))  # Choose a new vertex
+        cur_v = adj_lists[cur_v][random_index]
+        path.append(cur_v)
+    return path
+
+
+def simulate_walks_from_v(
+    adj_lists: list[list[int]], v: int, p_halt: float, n_walks: int
+) -> list[list[int]]:
+    """Simulate multiple random walks from a starting vertex."""
+    paths = []
+    for _ in range(n_walks):
+        paths.append(simulate_single_walk(adj_lists, v, p_halt))
+    return paths
+
+
+def simulate_walks_from_all(
+    adj_lists: list[list[int]], p_halt: float, n_walks: int
+) -> list[list[list[int]]]:
+    """
+    Simulate multiple random walks from all vertices.
+
+    Args:
+        adj_lists (list[list[int]]): Adjacency lists of the graph.
+        p_halt (float): Probability of halting at each step.
+        n_walks (int): Number of walks to simulate from each vertex.
+
+    Returns:
+        list[list[list[int]]]: [vertex i][walk j]
+            gives the j-th walk starting from vertex i.
+    """
+    all_walk_paths = []
+
+    for v in range(len(adj_lists)):
+        all_walk_paths.append(simulate_walks_from_v(adj_lists, v, p_halt, n_walks))
+
+    return all_walk_paths
+
+
+# ----- Functions to actually construct GRFs to approximate graph kernels -----
+
+
+def create_rf_vector_from_walk_paths(
+    U: np.ndarray,
+    adj_lists: list[list[int]],
+    p_halt: float,
+    v_walk_paths: list[list[int]],
+    f: Callable,
+) -> np.ndarray:
+    """
+    Create an RF vector for a node from a list of random walks.
+
+    Args:
+        U (np.ndarray): Normalised weighted adjacency matrix.
+        adj_lists (list[list[int]]): Adjacency lists of the graph.
+        p_halt (float): Probability of halting at each step.
+        v_walk_paths (list[list[int]]): List of random walks starting from a vertex.
+        f (Callable): Modulation function.
+    """
+
+    n_walks = len(v_walk_paths)
+    n_nodes = len(adj_lists)
+    rf_vector = np.zeros(n_nodes)
+
+    # Find the longest walk.
+    longest_walk = max(map(len, v_walk_paths))
+
+    # Evaluate modulation function f up to longest walk length.
+    f_vec = [float(f(length)) for length in range(longest_walk)]
+
+    # Store product of weights and marginal probabilities.
+    for walk in v_walk_paths:
+        weights_product = 1.0
+        marginal_prob = 1.0
+        for step, node in enumerate(walk):
+            rf_vector[node] += (weights_product / marginal_prob) * f_vec[step]
+            if step < len(walk) - 1:
+                weights_product *= U[walk[step]][walk[step + 1]]
+                marginal_prob *= (1 - p_halt) / len(adj_lists[node])
+
+    # Normalise by number of walks.
+    rf_vector /= n_walks
+
+    return rf_vector
+
+
+def get_random_feature(
+    U: np.ndarray,
+    adj_lists: list[list[int]],
+    p_halt: float,
+    all_walk_paths: list[list[list[int]]],
+    f: Callable,
+) -> np.ndarray:
+    """Combine the GRFs to get a kernel estimate."""
+    rf_vectors = []
+
+    # Stack up GRF vectors for each start node.
+    for v_walks_paths in all_walk_paths:
+        rf_v = create_rf_vector_from_walk_paths(U, adj_lists, p_halt, v_walks_paths, f)
+        rf_vectors.append(rf_v)
+
+    A = np.asarray(rf_vectors)
+
+    return A
+
+
+def frob_norm_error(K_true: np.ndarray, K_approx: np.ndarray) -> float:
+    """Compute the Frobenius norm error between two matrices."""
+    return float(np.linalg.norm(K_true - K_approx, ord="fro") / np.linalg.norm(K_true, ord="fro"))

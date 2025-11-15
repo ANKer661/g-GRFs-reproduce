@@ -1,6 +1,133 @@
-from typing import Callable
-import numpy as np
 import random
+from typing import Callable
+
+import numpy as np
+import scipy
+from scipy.special import gammaln
+
+
+class GroundtruthKernels:
+    """Compute the groundtruth kernel evaluations."""
+
+    def __init__(self, sigma: float, alpha: float) -> None:
+        self.functions = {
+            1: self.d_regularised_1,
+            2: self.d_regularised_2,
+            3: self.p_step_rw_2,
+            4: self.diffusion,
+            5: self.cosine,
+        }
+
+        self.sigma = sigma
+        self.alpha = alpha
+
+    def d_regularised_1(self, U: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+        """
+        d regularised Lapacian kernel with d=1. (I - W)^{-1}
+        """
+        E = np.eye(U.shape[0])
+        U = self.sigma**2 / (1 + self.sigma**2) * U
+        return np.linalg.inv((E - U)), U
+
+    def d_regularised_2(self, U: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+        """d regularised Lapacian kernel with d=2. (I - W)^{-2}"""
+        E = np.eye(U.shape[0])
+        U = self.sigma**2 / (1 + self.sigma**2) * U
+        I_minus_U = E - U
+        return np.linalg.inv(I_minus_U @ I_minus_U), U
+
+    def p_step_rw_2(self, U: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+        """p step RW kernel with d=2, (I + W)^2"""
+        E = np.eye(U.shape[0])
+        U = U / (self.alpha - 1)
+        I_plus_U = E + U
+        return I_plus_U @ I_plus_U, U
+
+    def diffusion(self, U: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+        """Diffusion kernel, exp(W)"""
+        U = self.sigma**2 * U / 2
+        return scipy.linalg.expm(U), U
+
+    def cosine(self, U: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+        """Cosine kernel, sqrt{2}cos(pi/4-U) = cos(U) + sin(U)."""
+        U = self.sigma**2 * U
+        return scipy.linalg.sinm(U) + scipy.linalg.cosm(U), U
+
+    def get_groundtruth_kernel(self, func_type: int, U: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+        """
+        Get the result of the modulation function of the given type.
+
+        Args:
+            func_type (int): The type of modulation (1 to 5).
+            U (np.ndarray): The input matrix.
+        """
+        if func_type not in self.functions:
+            raise ValueError(f"Invalid function type {func_type}. Must be between 1 and 5.")
+        return self.functions[func_type](U)
+
+
+class ModulationFunctions:
+    """
+    Modulation functions to generate GRFs, based on inverse convolution of Taylor expansion.
+    """
+
+    def __init__(self) -> None:
+        self.functions = {
+            1: self.d_regularised_1,
+            2: self.d_regularised_2,
+            3: self.p_step_rw_2,
+            4: self.diffusion,
+            5: self.cosine,
+        }
+
+    def d_regularised_1(self, x: int) -> float:
+        if x == 0:
+            return 1
+        else:
+            return scipy.special.factorial2(2 * x - 1) / (scipy.special.factorial2(2 * x))
+
+    def d_regularised_2(self, x: int) -> float:
+        return 1
+
+    def p_step_rw_2(self, x: int) -> float:
+        return scipy.special.binom(1, x)
+
+    def diffusion(self, x: int) -> float:
+        # 1 / (2**x * scipy.special.factorial(x))
+        # Use log to avoid overflow
+        log_val = -(x * np.log(2) + gammaln(x + 1))
+        return np.exp(log_val)
+
+    def alpha_func_cosine(self, k: int) -> float:
+        return (-1) ** (k // 2) / scipy.special.factorial(k)
+
+    def get_next_f_cosine(self, g_eval: float) -> float:
+        """Helper function for computing next f function evaluation."""
+
+        f0 = self.f_list[0]
+        f1 = self.f_list[1:]
+        f1_np = np.asarray(f1)
+        f1r_np = f1_np[::-1]
+        f1dot = np.dot(f1_np, f1r_np)
+        fnext = (g_eval - f1dot) / (2 * f0)
+        self.f_list.append(fnext)
+
+        return fnext
+
+    def cosine(self, x: int) -> float:
+        """
+        Here, there isn't a convenient closed form so we use the iterative formula in Eq. 6
+        * Optimized with caching *
+        """
+        if not hasattr(self, "f_list"):
+            self.f_list = [1.0]
+        if x < len(self.f_list):
+            return self.f_list[x]
+        else:
+            max_known = len(self.f_list) - 1
+            for i in range(max_known, x):
+                self.get_next_f_cosine(self.alpha_func_cosine(i + 1))
+            return self.f_list[-1]
 
 
 def get_U_matrix(W: np.ndarray) -> np.ndarray:

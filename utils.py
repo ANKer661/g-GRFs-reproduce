@@ -149,15 +149,23 @@ def get_U_matrix(W: np.ndarray) -> np.ndarray:
 
 def adj_matrix_to_lists(W: np.ndarray | torch.Tensor) -> tuple[list[list[int]], list[list[float]]]:
     """Get adjacency lists and weight lists for a weighted adjacency matrix"""
+
+    assert isinstance(W, np.ndarray) or isinstance(W, torch.Tensor), (
+        "W must be a numpy array or torch tensor."
+    )
     n = W.shape[0]
     adj_lists = []
     weight_lists = []
 
     for i in range(n):
-        neighbor_idx = np.nonzero(W[i, :])[0]
-        weights = W[i, neighbor_idx]
-        adj_lists.append(neighbor_idx.tolist())
-        weight_lists.append(weights.tolist())
+        if isinstance(W, torch.Tensor):
+            neighbor_idx = torch.nonzero(W[i, :]).squeeze(-1).tolist()
+            weights = W[i, neighbor_idx].tolist()
+        else:
+            neighbor_idx = np.nonzero(W[i, :])[0].tolist()
+            weights = W[i, neighbor_idx].tolist()
+        adj_lists.append(neighbor_idx)
+        weight_lists.append(weights)
 
     return adj_lists, weight_lists
 
@@ -300,23 +308,33 @@ def create_rf_vector_from_walk_paths_t(
 
     n_walks = len(v_walk_paths)
     n_nodes = len(adj_lists)
-    rf_vector = torch.zeros(n_nodes)
-    p_continue = 1 - p_halt
 
-    # Store product of weights and marginal probabilities.
+    device = U.device
+    dtype = U.dtype
+
+    rf_vector = torch.zeros(n_nodes, device=device, dtype=dtype)
+    log_p_continue = torch.log(torch.tensor(1.0 - p_halt, dtype=dtype, device=device))
+    degrees = [len(neighbors) for neighbors in adj_lists]
+    log_degrees = torch.log(torch.tensor(degrees, dtype=dtype, device=device) + 1e-10)
+    log_U = torch.log(U + 1e-10)
+
+    # working in log space to avoid numerical issues
     for walk in v_walk_paths:
-        weights_product = 1.0
-        marginal_prob = 1.0
+        log_weights_product = torch.tensor(0.0, dtype=dtype, device=device)
+        log_marginal_prob = torch.tensor(0.0, dtype=dtype, device=device)
+
         for step, node in enumerate(walk):
-            rf_vector[node] += (weights_product / marginal_prob) * f_vec[step]
+            log_load = log_weights_product - log_marginal_prob
+            load = torch.exp(log_load)
+
+            rf_vector[node] += load * f_vec[step]
 
             if step < len(walk) - 1:
-                weights_product *= U[walk[step]][walk[step + 1]]
-                marginal_prob *= (p_continue) / len(adj_lists[node])
+                next_node = walk[step + 1]
+                log_weights_product += log_U[node, next_node]
+                log_marginal_prob += log_p_continue - log_degrees[node]
 
-    # Normalise by number of walks.
-    rf_vector /= n_walks
-
+    rf_vector = rf_vector / n_walks
     return rf_vector
 
 

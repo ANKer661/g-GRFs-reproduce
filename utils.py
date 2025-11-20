@@ -352,7 +352,7 @@ def get_random_feature_t(
             max_length = max(max_length, len(walk))
 
     # Evaluate modulation function f up to longest walk length.
-    steps_tensor = torch.arange(max_length, dtype=torch.float32).unsqueeze(-1)
+    steps_tensor = torch.arange(max_length, dtype=torch.float32, device=U.device).unsqueeze(-1)
     f_vec = f(steps_tensor).squeeze(-1)
 
     rf_vectors = []
@@ -361,11 +361,15 @@ def get_random_feature_t(
         rf_v = create_rf_vector_from_walk_paths_t(U, adj_lists, p_halt, v_walks_paths, f_vec)
         rf_vectors.append(rf_v)
 
-    A = torch.stack(rf_vectors, dim=0)
+    A = torch.stack(rf_vectors, dim=0)  # type: ignore
 
     return A
 
 
-def frob_norm_error(K_true: np.ndarray, K_approx: np.ndarray) -> float:
+def frob_norm_error(K_true: np.ndarray | torch.Tensor, K_approx: np.ndarray | torch.Tensor) -> float:
     """Compute the Frobenius norm error between two matrices."""
+    if isinstance(K_true, torch.Tensor):
+        K_true = K_true.cpu().numpy()
+    if isinstance(K_approx, torch.Tensor):
+        K_approx = K_approx.cpu().numpy()
     return float(np.linalg.norm(K_true - K_approx, ord="fro") / np.linalg.norm(K_true, ord="fro"))

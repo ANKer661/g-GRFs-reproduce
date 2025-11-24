@@ -4,6 +4,7 @@ from typing import Callable
 import numpy as np
 import scipy
 import torch
+from numba import njit
 from scipy.special import gammaln
 
 
@@ -220,43 +221,75 @@ def simulate_walks_from_all(
 # ----- Functions to actually construct GRFs to approximate graph kernels -----
 
 
-def create_rf_vector_from_walk_paths(
+@njit(fastmath=True, cache=True)
+def create_rf_vector(
     U: np.ndarray,
-    adj_lists: list[list[int]],
+    degrees: np.ndarray,
     p_halt: float,
-    v_walk_paths: list[list[int]],
-    f_vec: list[float],
+    walks_flat: np.ndarray,
+    walk_starts: np.ndarray,
+    walk_ends: np.ndarray,
+    f_vec: np.ndarray,
 ) -> np.ndarray:
     """
     Create an RF vector for a node from a list of random walks.
 
     Args:
         U (np.ndarray): Normalised weighted adjacency matrix.
-        adj_lists (list[list[int]]): Adjacency lists of the graph.
+        degrees (np.ndarray): Degrees of the nodes.
         p_halt (float): Probability of halting at each step.
-        v_walk_paths (list[list[int]]): List of random walks starting from a vertex.
-        f_vec (list[float]): Precomputed modulation function evaluations.
+        walks_flat (np.ndarray): Flattened array of all walks.
+        walk_starts (np.ndarray): Start indices of each walk in walks_flat.
+        walk_ends (np.ndarray): End indices of each walk in walks_flat.
+        f_vec (np.ndarray): Precomputed modulation function evaluations.
     """
+    n_nodes = U.shape[0]
+    n_walks = len(walk_starts)
+    rf_vector = np.zeros(n_nodes, dtype=np.float64)
+    p_continue = 1.0 - p_halt
 
-    n_walks = len(v_walk_paths)
-    n_nodes = len(adj_lists)
-    rf_vector = np.zeros(n_nodes)
-    p_continue = 1 - p_halt
+    for walk_idx in range(n_walks):
+        start = walk_starts[walk_idx]
+        end = walk_ends[walk_idx]
 
-    # Store product of weights and marginal probabilities.
-    for walk in v_walk_paths:
         weights_product = 1.0
         marginal_prob = 1.0
-        for step, node in enumerate(walk):
+
+        for pos in range(start, end):
+            node = walks_flat[pos]
+            step = pos - start
+
             rf_vector[node] += (weights_product / marginal_prob) * f_vec[step]
-            if step < len(walk) - 1:
-                weights_product *= U[walk[step]][walk[step + 1]]
-                marginal_prob *= (p_continue) / len(adj_lists[node])
 
-    # Normalise by number of walks.
+            if pos < end - 1:
+                next_node = walks_flat[pos + 1]
+                weights_product *= U[node, next_node]
+                marginal_prob *= p_continue / degrees[node]
+
     rf_vector /= n_walks
-
     return rf_vector
+
+
+def flatten_walks(v_walks_paths: list[list[int]]) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """
+    Flatten random walk lists into 3 1-d arrays for numba.
+    """
+    walks_flat = []
+    walk_starts = []
+    walk_ends = []
+
+    pos = 0
+    for walk in v_walks_paths:
+        walk_starts.append(pos)
+        walks_flat.extend(walk)
+        pos += len(walk)
+        walk_ends.append(pos)
+
+    return (
+        np.array(walks_flat, dtype=np.int32),
+        np.array(walk_starts, dtype=np.int32),
+        np.array(walk_ends, dtype=np.int32),
+    )
 
 
 def get_random_feature(
@@ -267,25 +300,22 @@ def get_random_feature(
     f: Callable,
 ) -> np.ndarray:
     """Combine the GRFs to get a kernel estimate."""
-    rf_vectors = []
+    n_nodes = len(adj_lists)
 
-    # Find the longest walk.
-    longest_walk = 0
-    for v_walks in all_walk_paths:
-        for walk in v_walks:
-            longest_walk = max(longest_walk, len(walk))
+    # precompute modulation func and degrees
+    longest_walk = max(len(walk) for v_walks in all_walk_paths for walk in v_walks)
+    f_vec = np.array([float(f(length)) for length in range(longest_walk)], dtype=np.float64)
+    degrees = np.array([len(neighbors) for neighbors in adj_lists], dtype=np.float64)
 
-    # Evaluate modulation function f up to longest walk length.
-    f_vec = [float(f(length)) for length in range(longest_walk)]
+    rf_matrix = np.empty((n_nodes, n_nodes), dtype=np.float64)
+    # process each node
+    for idx, v_walks_paths in enumerate(all_walk_paths):
+        walks_flat, walk_starts, walk_ends = flatten_walks(v_walks_paths)
+        rf_matrix[idx] = create_rf_vector(
+            U, degrees, p_halt, walks_flat, walk_starts, walk_ends, f_vec
+        )
 
-    # Stack up GRF vectors for each start node.
-    for v_walks_paths in all_walk_paths:
-        rf_v = create_rf_vector_from_walk_paths(U, adj_lists, p_halt, v_walks_paths, f_vec)
-        rf_vectors.append(rf_v)
-
-    A = np.asarray(rf_vectors)
-
-    return A
+    return rf_matrix
 
 
 def create_rf_vector_from_walk_paths_t(
@@ -344,6 +374,7 @@ def get_random_feature_t(
     p_halt: float,
     all_walk_paths: list[list[list[int]]],
     f: torch.nn.Module,
+    # sigma: float = 1.0,
 ) -> torch.Tensor:
     # Find the longest walk.
     max_length = 0
@@ -354,6 +385,9 @@ def get_random_feature_t(
     # Evaluate modulation function f up to longest walk length.
     steps_tensor = torch.arange(max_length, dtype=torch.float32, device=U.device).unsqueeze(-1)
     f_vec = f(steps_tensor).squeeze(-1)
+
+    # if sigma != 1.0:
+    #     f_vec *= torch.exp(steps_tensor * torch.log(torch.tensor(sigma, device=U.device))).squeeze(-1)
 
     rf_vectors = []
     # Stack up GRF vectors for each start node.

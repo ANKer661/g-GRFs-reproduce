@@ -4,8 +4,23 @@ from typing import Callable
 import numpy as np
 import scipy
 import torch
+import torch.nn as nn
 from numba import njit
 from scipy.special import gammaln
+
+
+class NeuralModulationFunction(nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+        self.model = nn.Sequential(
+            nn.Linear(1, 1, bias=True),
+            nn.ReLU(),
+            nn.Linear(1, 1, bias=True),
+            nn.Softplus()
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.model(x)
 
 
 class GroundtruthKernels:
@@ -318,10 +333,10 @@ def get_random_feature(
     return rf_matrix
 
 
-def create_rf_vector_from_walk_paths_t(
-    U: torch.Tensor,
-    adj_lists: list[list[int]],
-    p_halt: float,
+def create_rf_vector_t(
+    log_U: torch.Tensor,
+    log_degrees: torch.Tensor,
+    log_p_continue: torch.Tensor,
     v_walk_paths: list[list[int]],
     f_vec: torch.Tensor,
 ) -> torch.Tensor:
@@ -335,19 +350,12 @@ def create_rf_vector_from_walk_paths_t(
         v_walk_paths (list[list[int]]): List of random walks starting from a vertex.
         f_vec (torch.Tensor): Precomputed modulation function evaluations.
     """
-
+    dtype = log_U.dtype
+    device = log_U.device
     n_walks = len(v_walk_paths)
-    n_nodes = len(adj_lists)
-
-    device = U.device
-    dtype = U.dtype
+    n_nodes = log_U.size(0)
 
     rf_vector = torch.zeros(n_nodes, device=device, dtype=dtype)
-    log_p_continue = torch.log(torch.tensor(1.0 - p_halt, dtype=dtype, device=device))
-    degrees = [len(neighbors) for neighbors in adj_lists]
-    log_degrees = torch.log(torch.tensor(degrees, dtype=dtype, device=device) + 1e-10)
-    log_U = torch.log(U + 1e-10)
-
     # working in log space to avoid numerical issues
     for walk in v_walk_paths:
         log_weights_product = torch.tensor(0.0, dtype=dtype, device=device)
@@ -374,28 +382,26 @@ def get_random_feature_t(
     p_halt: float,
     all_walk_paths: list[list[list[int]]],
     f: torch.nn.Module,
-    # sigma: float = 1.0,
 ) -> torch.Tensor:
-    # Find the longest walk.
-    max_length = 0
-    for v_walks in all_walk_paths:
-        for walk in v_walks:
-            max_length = max(max_length, len(walk))
+    n_nodes = len(adj_lists)
+    dtype = U.dtype
+    device = U.device
 
-    # Evaluate modulation function f up to longest walk length.
+    # evaluate modulation function f up to longest walk length.
+    max_length = max(len(walk) for v_walks in all_walk_paths for walk in v_walks)
     steps_tensor = torch.arange(max_length, dtype=torch.float32, device=U.device).unsqueeze(-1)
     f_vec = f(steps_tensor).squeeze(-1)
 
-    # if sigma != 1.0:
-    #     f_vec *= torch.exp(steps_tensor * torch.log(torch.tensor(sigma, device=U.device))).squeeze(-1)
+    # precompute all constants
+    degrees = [len(neighbors) for neighbors in adj_lists]
+    log_degrees = torch.log(torch.tensor(degrees, dtype=dtype, device=device) + 1e-10)
+    log_p_continue = torch.log(torch.tensor(1.0 - p_halt, dtype=dtype, device=device))
+    log_U = torch.log(U + 1e-10)
 
-    rf_vectors = []
-    # Stack up GRF vectors for each start node.
-    for v_walks_paths in all_walk_paths:
-        rf_v = create_rf_vector_from_walk_paths_t(U, adj_lists, p_halt, v_walks_paths, f_vec)
-        rf_vectors.append(rf_v)
-
-    A = torch.stack(rf_vectors, dim=0)  # type: ignore
+    # preallocate output matrix
+    A = torch.empty((n_nodes, n_nodes), dtype=dtype, device=device)
+    for i, v_walks_paths in enumerate(all_walk_paths):
+        A[i] = create_rf_vector_t(log_U, log_degrees, log_p_continue, v_walks_paths, f_vec)
 
     return A
 

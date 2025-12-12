@@ -29,7 +29,7 @@ conda env create -f environment.yml
 conda activate g-grfs
 
 pip3 install torch torchvision torchaudio  # we only need cpu version
-pip install trimesh  # used to load 3D meshes
+pip3 install trimesh  # used to load 3D meshes
 ```
 
 ### 2. Running the Code

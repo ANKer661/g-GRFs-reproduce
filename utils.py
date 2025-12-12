@@ -1,9 +1,26 @@
+import gc
 import random
+import time
+import tracemalloc
 from typing import Callable
 
 import numpy as np
 import scipy
+import torch
+import torch.nn as nn
+from numba import njit
 from scipy.special import gammaln
+
+
+class NeuralModulationFunction(nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+        self.model = nn.Sequential(
+            nn.Linear(1, 1, bias=True), nn.ReLU(), nn.Linear(1, 1, bias=True), nn.Softplus()
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.model(x)
 
 
 class GroundtruthKernels:
@@ -146,17 +163,25 @@ def get_U_matrix(W: np.ndarray) -> np.ndarray:
 # ----- Functions to do with sampling random walks. -----
 
 
-def adj_matrix_to_lists(W: np.ndarray) -> tuple[list[list[int]], list[list[float]]]:
+def adj_matrix_to_lists(W: np.ndarray | torch.Tensor) -> tuple[list[list[int]], list[list[float]]]:
     """Get adjacency lists and weight lists for a weighted adjacency matrix"""
+
+    assert isinstance(W, np.ndarray) or isinstance(W, torch.Tensor), (
+        "W must be a numpy array or torch tensor."
+    )
     n = W.shape[0]
     adj_lists = []
     weight_lists = []
 
     for i in range(n):
-        neighbor_idx = np.nonzero(W[i, :])[0]
-        weights = W[i, neighbor_idx]
-        adj_lists.append(neighbor_idx.tolist())
-        weight_lists.append(weights.tolist())
+        if isinstance(W, torch.Tensor):
+            neighbor_idx = torch.nonzero(W[i, :]).squeeze(-1).tolist()
+            weights = W[i, neighbor_idx].tolist()
+        else:
+            neighbor_idx = np.nonzero(W[i, :])[0].tolist()
+            weights = W[i, neighbor_idx].tolist()
+        adj_lists.append(neighbor_idx)
+        weight_lists.append(weights)
 
     return adj_lists, weight_lists
 
@@ -211,48 +236,76 @@ def simulate_walks_from_all(
 # ----- Functions to actually construct GRFs to approximate graph kernels -----
 
 
-def create_rf_vector_from_walk_paths(
+@njit(fastmath=True, cache=True)
+def create_rf_vector(
     U: np.ndarray,
-    adj_lists: list[list[int]],
+    degrees: np.ndarray,
     p_halt: float,
-    v_walk_paths: list[list[int]],
-    f: Callable,
+    walks_flat: np.ndarray,
+    walk_starts: np.ndarray,
+    walk_ends: np.ndarray,
+    f_vec: np.ndarray,
 ) -> np.ndarray:
     """
     Create an RF vector for a node from a list of random walks.
 
     Args:
         U (np.ndarray): Normalised weighted adjacency matrix.
-        adj_lists (list[list[int]]): Adjacency lists of the graph.
+        degrees (np.ndarray): Degrees of the nodes.
         p_halt (float): Probability of halting at each step.
-        v_walk_paths (list[list[int]]): List of random walks starting from a vertex.
-        f (Callable): Modulation function.
+        walks_flat (np.ndarray): Flattened array of all walks.
+        walk_starts (np.ndarray): Start indices of each walk in walks_flat.
+        walk_ends (np.ndarray): End indices of each walk in walks_flat.
+        f_vec (np.ndarray): Precomputed modulation function evaluations.
     """
+    n_nodes = U.shape[0]
+    n_walks = len(walk_starts)
+    rf_vector = np.zeros(n_nodes, dtype=np.float64)
+    log_degrees = np.log(degrees + 1e-10)
+    log_p_continue = np.log(1.0 - p_halt)
 
-    n_walks = len(v_walk_paths)
-    n_nodes = len(adj_lists)
-    rf_vector = np.zeros(n_nodes)
+    for walk_idx in range(n_walks):
+        start = walk_starts[walk_idx]
+        end = walk_ends[walk_idx]
 
-    # Find the longest walk.
-    longest_walk = max(map(len, v_walk_paths))
+        log_weights_product = 0.0
+        log_marginal_prob = 0.0
 
-    # Evaluate modulation function f up to longest walk length.
-    f_vec = [float(f(length)) for length in range(longest_walk)]
+        for pos in range(start, end):
+            node = walks_flat[pos]
+            step = pos - start
 
-    # Store product of weights and marginal probabilities.
-    for walk in v_walk_paths:
-        weights_product = 1.0
-        marginal_prob = 1.0
-        for step, node in enumerate(walk):
-            rf_vector[node] += (weights_product / marginal_prob) * f_vec[step]
-            if step < len(walk) - 1:
-                weights_product *= U[walk[step]][walk[step + 1]]
-                marginal_prob *= (1 - p_halt) / len(adj_lists[node])
+            rf_vector[node] += np.exp(log_weights_product - log_marginal_prob) * f_vec[step]
 
-    # Normalise by number of walks.
+            if pos < end - 1:
+                next_node = walks_flat[pos + 1]
+                log_weights_product += np.log(U[node, next_node] + 1e-10)
+                log_marginal_prob += log_p_continue - log_degrees[node]
+
     rf_vector /= n_walks
-
     return rf_vector
+
+
+def flatten_walks(v_walks_paths: list[list[int]]) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """
+    Flatten random walk lists into 3 1-d arrays for numba.
+    """
+    walks_flat = []
+    walk_starts = []
+    walk_ends = []
+
+    pos = 0
+    for walk in v_walks_paths:
+        walk_starts.append(pos)
+        walks_flat.extend(walk)
+        pos += len(walk)
+        walk_ends.append(pos)
+
+    return (
+        np.array(walks_flat, dtype=np.int32),
+        np.array(walk_starts, dtype=np.int32),
+        np.array(walk_ends, dtype=np.int32),
+    )
 
 
 def get_random_feature(
@@ -263,18 +316,145 @@ def get_random_feature(
     f: Callable,
 ) -> np.ndarray:
     """Combine the GRFs to get a kernel estimate."""
-    rf_vectors = []
+    n_nodes = len(adj_lists)
 
-    # Stack up GRF vectors for each start node.
-    for v_walks_paths in all_walk_paths:
-        rf_v = create_rf_vector_from_walk_paths(U, adj_lists, p_halt, v_walks_paths, f)
-        rf_vectors.append(rf_v)
+    # precompute modulation func and degrees
+    longest_walk = max(len(walk) for v_walks in all_walk_paths for walk in v_walks)
+    f_vec = np.array([float(f(length)) for length in range(longest_walk)], dtype=np.float64)
+    degrees = np.array([len(neighbors) for neighbors in adj_lists], dtype=np.float64)
 
-    A = np.asarray(rf_vectors)
+    rf_matrix = np.empty((n_nodes, n_nodes), dtype=np.float64)
+    # process each node
+    for idx, v_walks_paths in enumerate(all_walk_paths):
+        walks_flat, walk_starts, walk_ends = flatten_walks(v_walks_paths)
+        rf_matrix[idx] = create_rf_vector(
+            U, degrees, p_halt, walks_flat, walk_starts, walk_ends, f_vec
+        )
+
+    return rf_matrix
+
+
+def create_rf_vector_t(
+    log_U: torch.Tensor,
+    log_degrees: torch.Tensor,
+    log_p_continue: torch.Tensor,
+    v_walk_paths: list[list[int]],
+    f_vec: torch.Tensor,
+) -> torch.Tensor:
+    """
+    Create an RF vector for a node from a list of random walks.
+
+    Args:
+        U (torch.Tensor): Normalised weighted adjacency matrix.
+        adj_lists (list[list[int]]): Adjacency lists of the graph.
+        p_halt (float): Probability of halting at each step.
+        v_walk_paths (list[list[int]]): List of random walks starting from a vertex.
+        f_vec (torch.Tensor): Precomputed modulation function evaluations.
+    """
+    dtype = log_U.dtype
+    device = log_U.device
+    n_walks = len(v_walk_paths)
+    n_nodes = log_U.size(0)
+
+    rf_vector = torch.zeros(n_nodes, device=device, dtype=dtype)
+    # working in log space to avoid numerical issues
+    for walk in v_walk_paths:
+        log_weights_product = torch.tensor(0.0, dtype=dtype, device=device)
+        log_marginal_prob = torch.tensor(0.0, dtype=dtype, device=device)
+
+        for step, node in enumerate(walk):
+            log_load = log_weights_product - log_marginal_prob
+            load = torch.exp(log_load)
+
+            rf_vector[node] += load * f_vec[step]
+
+            if step < len(walk) - 1:
+                next_node = walk[step + 1]
+                log_weights_product += log_U[node, next_node]
+                log_marginal_prob += log_p_continue - log_degrees[node]
+
+    rf_vector = rf_vector / n_walks
+    return rf_vector
+
+
+def get_random_feature_t(
+    U: torch.Tensor,
+    adj_lists: list[list[int]],
+    p_halt: float,
+    all_walk_paths: list[list[list[int]]],
+    f: torch.nn.Module,
+) -> torch.Tensor:
+    n_nodes = len(adj_lists)
+    dtype = U.dtype
+    device = U.device
+
+    # evaluate modulation function f up to longest walk length.
+    max_length = max(len(walk) for v_walks in all_walk_paths for walk in v_walks)
+    steps_tensor = torch.arange(max_length, dtype=torch.float32, device=U.device).unsqueeze(-1)
+    f_vec = f(steps_tensor).squeeze(-1)
+
+    # precompute all constants
+    degrees = [len(neighbors) for neighbors in adj_lists]
+    log_degrees = torch.log(torch.tensor(degrees, dtype=dtype, device=device) + 1e-10)
+    log_p_continue = torch.log(torch.tensor(1.0 - p_halt, dtype=dtype, device=device))
+    log_U = torch.log(U + 1e-10)
+
+    # preallocate output matrix
+    A = torch.empty((n_nodes, n_nodes), dtype=dtype, device=device)
+    for i, v_walks_paths in enumerate(all_walk_paths):
+        A[i] = create_rf_vector_t(log_U, log_degrees, log_p_continue, v_walks_paths, f_vec)
 
     return A
 
 
-def frob_norm_error(K_true: np.ndarray, K_approx: np.ndarray) -> float:
+def frob_norm_error(K_true: np.ndarray | torch.Tensor, K_approx: np.ndarray | torch.Tensor) -> float:
     """Compute the Frobenius norm error between two matrices."""
+    if isinstance(K_true, torch.Tensor):
+        K_true = K_true.cpu().numpy()
+    if isinstance(K_approx, torch.Tensor):
+        K_approx = K_approx.cpu().numpy()
     return float(np.linalg.norm(K_true - K_approx, ord="fro") / np.linalg.norm(K_true, ord="fro"))
+
+
+
+
+
+class MemoryTimer:
+    """
+    一个用于测量 Python 代码块执行期间的峰值内存使用量和运行时间的上下文管理器。
+
+    用法:
+    with MemoryTimer() as mt:
+        # 你的内存密集型代码在这里运行
+        run_my_process()
+    
+    # 退出 with 块后，会自动打印报告
+    """
+    def __enter__(self):
+        gc.collect() 
+        
+        # 启动内存跟踪和计时器
+        self._start_time = time.time()
+        tracemalloc.start()
+        
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        # 停止内存跟踪和计时器
+        self._end_time = time.time()
+        current_mem_bytes, peak_mem_bytes = tracemalloc.get_traced_memory()
+        tracemalloc.stop()
+
+        # 计算时间和内存（转换为 MiB）
+        self.run_time = self._end_time - self._start_time
+        self.current_mem_mib = current_mem_bytes / (1024 * 1024)
+        self.peak_mem_mib = peak_mem_bytes / (1024 * 1024)
+
+        # 打印报告
+        print("-" * 40)
+        print(f"执行时间: {self.run_time:.4f} 秒")
+        print(f"当前内存占用: {self.current_mem_mib:.2f} MiB")
+        print(f"**峰值内存占用**: {self.peak_mem_mib:.2f} MiB")
+        print("-" * 40)
+
+        return False 

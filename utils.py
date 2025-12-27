@@ -1,7 +1,4 @@
-import gc
 import random
-import time
-import tracemalloc
 from typing import Callable
 
 import numpy as np
@@ -415,46 +412,3 @@ def frob_norm_error(K_true: np.ndarray | torch.Tensor, K_approx: np.ndarray | to
         K_approx = K_approx.cpu().numpy()
     return float(np.linalg.norm(K_true - K_approx, ord="fro") / np.linalg.norm(K_true, ord="fro"))
 
-
-
-
-
-class MemoryTimer:
-    """
-    一个用于测量 Python 代码块执行期间的峰值内存使用量和运行时间的上下文管理器。
-
-    用法:
-    with MemoryTimer() as mt:
-        # 你的内存密集型代码在这里运行
-        run_my_process()
-    
-    # 退出 with 块后，会自动打印报告
-    """
-    def __enter__(self):
-        gc.collect() 
-        
-        # 启动内存跟踪和计时器
-        self._start_time = time.time()
-        tracemalloc.start()
-        
-        return self
-
-    def __exit__(self, exc_type, exc_val, exc_tb):
-        # 停止内存跟踪和计时器
-        self._end_time = time.time()
-        current_mem_bytes, peak_mem_bytes = tracemalloc.get_traced_memory()
-        tracemalloc.stop()
-
-        # 计算时间和内存（转换为 MiB）
-        self.run_time = self._end_time - self._start_time
-        self.current_mem_mib = current_mem_bytes / (1024 * 1024)
-        self.peak_mem_mib = peak_mem_bytes / (1024 * 1024)
-
-        # 打印报告
-        print("-" * 40)
-        print(f"执行时间: {self.run_time:.4f} 秒")
-        print(f"当前内存占用: {self.current_mem_mib:.2f} MiB")
-        print(f"**峰值内存占用**: {self.peak_mem_mib:.2f} MiB")
-        print("-" * 40)
-
-        return False 
